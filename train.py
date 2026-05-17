@@ -289,6 +289,8 @@ def main() -> None:
     model_args = {
         "user_int_feature_specs": user_int_feature_specs,
         "item_int_feature_specs": item_int_feature_specs,
+        "user_int_feature_ids": pcvr_dataset.user_int_schema.feature_ids,
+        "item_int_feature_ids": pcvr_dataset.item_int_schema.feature_ids,
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
@@ -321,10 +323,7 @@ def main() -> None:
             if args.user_paired_dense_fids else None
         ),
         "user_dense_feature_specs": (
-            build_feature_specs(
-                pcvr_dataset.user_dense_schema,
-                [1] * pcvr_dataset.user_dense_schema.total_dim,
-            )
+            pcvr_dataset.user_dense_schema.entries
             if args.user_paired_dense_fids else None
         ),
         "use_weighted_fusion": args.use_weighted_fusion,

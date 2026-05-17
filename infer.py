@@ -69,6 +69,8 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    'user_paired_dense_fids': None,
+    'use_weighted_fusion': True,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -102,6 +104,20 @@ def _parse_seq_max_lens(sml_str: str) -> Dict[str, int]:
         k, v = pair.split(':')
         seq_max_lens[k.strip()] = int(v.strip())
     return seq_max_lens
+
+
+def _parse_paired_dense_fids(value: Any) -> Optional[List[int]]:
+    """Normalize train_config's paired-fid value into ``Optional[List[int]]``."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        return [int(x.strip()) for x in value.split(',') if x.strip()]
+    if isinstance(value, list):
+        return [int(x) for x in value] or None
+    return [int(value)]
 
 
 def load_train_config(model_dir: str) -> Dict[str, Any]:
@@ -139,6 +155,12 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
     """
     cfg: Dict[str, Any] = {}
     for key in _MODEL_CFG_KEYS:
+        if key == 'user_paired_dense_fids':
+            cfg[key] = _parse_paired_dense_fids(
+                train_config.get(key, _FALLBACK_MODEL_CFG[key])
+            )
+            continue
+
         if key == 'num_time_buckets':
             if 'num_time_buckets' in train_config:
                 cfg[key] = train_config['num_time_buckets']
@@ -221,16 +243,22 @@ def build_model(
     item_int_feature_specs = build_feature_specs(
         dataset.item_int_schema, dataset.item_int_vocab_sizes)
 
+    model_kwargs = dict(model_cfg)
+    if model_kwargs.get('user_paired_dense_fids'):
+        model_kwargs['user_dense_feature_specs'] = dataset.user_dense_schema.entries
+
     logging.info(f"Building PCVRHyFormer with cfg: {model_cfg}")
     model = PCVRHyFormer(
         user_int_feature_specs=user_int_feature_specs,
         item_int_feature_specs=item_int_feature_specs,
+        user_int_feature_ids=dataset.user_int_schema.feature_ids,
+        item_int_feature_ids=dataset.item_int_schema.feature_ids,
         user_dense_dim=dataset.user_dense_schema.total_dim,
         item_dense_dim=dataset.item_dense_schema.total_dim,
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
-        **model_cfg,
+        **model_kwargs,
     ).to(device)
 
     return model

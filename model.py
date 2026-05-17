@@ -1086,6 +1086,7 @@ class RankMixerNSTokenizer(nn.Module):
         d_model: int,
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
+        feature_ids: Optional[List[int]] = None,
         paired_dense_dims: Optional[dict] = None,
         use_weighted_fusion: bool = True,
     ) -> None:
@@ -1105,8 +1106,15 @@ class RankMixerNSTokenizer(nn.Module):
         self.emb_dim = emb_dim
         self.num_ns_tokens = num_ns_tokens
         self.emb_skip_threshold = emb_skip_threshold
+        self.feature_ids = feature_ids or list(range(len(feature_specs)))
         self.paired_dense_dims = paired_dense_dims or {}
         self.use_weighted_fusion = use_weighted_fusion
+
+        if len(self.feature_ids) != len(feature_specs):
+            raise ValueError(
+                f"feature_ids length ({len(self.feature_ids)}) must match "
+                f"feature_specs length ({len(feature_specs)})"
+            )
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
@@ -1152,9 +1160,10 @@ class RankMixerNSTokenizer(nn.Module):
 
             for group in groups:
                 for fid_idx in group:
+                    feature_id = self.feature_ids[fid_idx]
                     vs, offset, length = self.feature_specs[fid_idx]
-                    if fid_idx in self.paired_dense_dims:
-                        dense_dim = self.paired_dense_dims[fid_idx]
+                    if feature_id in self.paired_dense_dims:
+                        dense_dim = self.paired_dense_dims[feature_id]
                         total_emb_dim += dense_dim * length
 
         # Pad total_emb_dim to be divisible by num_ns_tokens
@@ -1206,11 +1215,27 @@ class RankMixerNSTokenizer(nn.Module):
         all_embs = []
         for group in self.groups:
             for fid_idx in group:
+                feature_id = self.feature_ids[fid_idx]
                 vs, offset, length = self.feature_specs[fid_idx]
                 emb_real_idx = self._emb_index[fid_idx]
+                vals = None
+                emb_all = None
+                mask = None
+                count = None
 
                 if emb_real_idx == -1:
-                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
+                    if length == 1:
+                        fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
+                    else:
+                        vals = int_feats[:, offset:offset + length].long()
+                        emb_all = int_feats.new_zeros(
+                            int_feats.shape[0], length, self.emb_dim, dtype=torch.float32
+                        )
+                        mask = (vals != 0).float().unsqueeze(-1)
+                        count = mask.sum(dim=1).clamp(min=1)
+                        fid_emb = int_feats.new_zeros(
+                            int_feats.shape[0], self.emb_dim, dtype=torch.float32
+                        )
                 else:
                     emb_layer = self.embs[emb_real_idx]
                     if length == 1:
@@ -1223,36 +1248,51 @@ class RankMixerNSTokenizer(nn.Module):
                         fid_emb = (emb_all * mask).sum(dim=1) / count  # (B, emb_dim)
 
                 # Apply weighted fusion if this feature has paired dense values
-                if (fid_idx in self.paired_dense_dims and
+                if (feature_id in self.paired_dense_dims and
                         dense_feats is not None and
-                        fid_idx in dense_fid_map and
+                        feature_id in dense_fid_map and
                         self.use_weighted_fusion):
 
-                    dense_offset, dense_len = dense_fid_map[fid_idx]
+                    dense_offset, _ = dense_fid_map[feature_id]
+                    dense_dim = self.paired_dense_dims[feature_id]
 
                     if length == 1:
                         # Scalar case: get dense value and project to weight
-                        dense_val = dense_feats[:, dense_offset:dense_offset + dense_len]  # (B, dense_len)
-                        weight = self.dense_weight_projs[str(fid_idx)](dense_val)  # (B, emb_dim)
+                        dense_val = dense_feats[:, dense_offset:dense_offset + dense_dim]  # (B, dense_dim)
+                        weight = self.dense_weight_projs[str(feature_id)](dense_val)  # (B, emb_dim)
                         fid_emb = fid_emb * weight  # Element-wise gating
                     else:
                         # Array case: need to align and pool
-                        dense_array = dense_feats[:, dense_offset:dense_offset + dense_len * length]
-                        dense_reshaped = dense_array.view(-1, length, dense_len)  # (B, length, dense_len)
+                        dense_array = dense_feats[:, dense_offset:dense_offset + dense_dim * length]
+                        dense_reshaped = dense_array.view(-1, length, dense_dim)  # (B, length, dense_dim)
 
                         # Project to weight space
-                        weight_all = self.dense_weight_projs[str(fid_idx)](dense_reshaped)  # (B, length, emb_dim)
+                        weight_all = self.dense_weight_projs[str(feature_id)](dense_reshaped)  # (B, length, emb_dim)
 
                         # Use same mask as int array
-                        vals = int_feats[:, offset:offset + length].long()
-                        mask = (vals != 0).float().unsqueeze(-1)  # (B, length, 1)
-                        count = mask.sum(dim=1).clamp(min=1)  # (B, 1)
+                        if vals is None:
+                            vals = int_feats[:, offset:offset + length].long()
+                        if mask is None:
+                            mask = (vals != 0).float().unsqueeze(-1)  # (B, length, 1)
+                        if count is None:
+                            count = mask.sum(dim=1).clamp(min=1)  # (B, 1)
+                        if emb_all is None:
+                            emb_all = fid_emb.unsqueeze(1)
 
                         # Apply weighting before pooling
-                        weighted_emb = fid_emb.unsqueeze(1) * weight_all if length == 1 else emb_all * weight_all
+                        weighted_emb = emb_all * weight_all
                         fid_emb = (weighted_emb * mask).sum(dim=1) / count  # (B, emb_dim)
 
                 all_embs.append(fid_emb)
+
+                if (feature_id in self.paired_dense_dims and
+                        dense_feats is not None and
+                        feature_id in dense_fid_map and
+                        not self.use_weighted_fusion):
+                    dense_offset, _ = dense_fid_map[feature_id]
+                    dense_dim = self.paired_dense_dims[feature_id]
+                    dense_val = dense_feats[:, dense_offset:dense_offset + dense_dim * length]
+                    all_embs.append(dense_val)
 
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
 
@@ -1287,6 +1327,8 @@ class PCVRHyFormer(nn.Module):
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
+        user_int_feature_ids: Optional[List[int]] = None,
+        item_int_feature_ids: Optional[List[int]] = None,
         # Model hyperparameters
         d_model: int = 64,
         emb_dim: int = 64,
@@ -1330,16 +1372,35 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.abs_time_emb_dim = abs_time_emb_dim
+        self.user_int_feature_ids = user_int_feature_ids or list(range(len(user_int_feature_specs)))
+        self.item_int_feature_ids = item_int_feature_ids or list(range(len(item_int_feature_specs)))
+
+        if len(self.user_int_feature_ids) != len(user_int_feature_specs):
+            raise ValueError("user_int_feature_ids length must match user_int_feature_specs length")
+        if len(self.item_int_feature_ids) != len(item_int_feature_specs):
+            raise ValueError("item_int_feature_ids length must match item_int_feature_specs length")
 
         # Build paired dense dims dict for user features
         user_paired_dense_dims = {}
+        user_fid_to_idx = {fid: i for i, fid in enumerate(self.user_int_feature_ids)}
+        dense_fid_to_len = {
+            dense_fid: dense_len
+            for dense_fid, dense_offset, dense_len in (user_dense_feature_specs or [])
+        }
         if user_paired_dense_fids and user_dense_feature_specs:
             for fid in user_paired_dense_fids:
-                # Find dense spec for this fid
-                for dense_fid, dense_offset, dense_len in user_dense_feature_specs:
-                    if dense_fid == fid:
-                        user_paired_dense_dims[fid] = dense_len
-                        break
+                if fid not in user_fid_to_idx or fid not in dense_fid_to_len:
+                    logging.warning(f"Skip paired dense fid {fid}: missing user int or dense schema entry")
+                    continue
+
+                _, _, int_len = user_int_feature_specs[user_fid_to_idx[fid]]
+                dense_len = dense_fid_to_len[fid]
+                if int_len <= 0 or dense_len % int_len != 0:
+                    raise ValueError(
+                        f"Paired dense fid {fid} has incompatible lengths: "
+                        f"user_int length={int_len}, user_dense length={dense_len}"
+                    )
+                user_paired_dense_dims[fid] = dense_len // int_len
 
         # ================== NS Tokens Construction ==================
 
@@ -1376,8 +1437,9 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=user_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                feature_ids=self.user_int_feature_ids,
                 paired_dense_dims=user_paired_dense_dims,
-                use_weighted_fusion=use_weighted_fusion,  # ← 传递加权配置
+                use_weighted_fusion=use_weighted_fusion,
             )
             num_user_ns = user_ns_tokens
 
@@ -1388,6 +1450,7 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=item_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                feature_ids=self.item_int_feature_ids,
             )
             num_item_ns = item_ns_tokens
         else:
