@@ -12,6 +12,8 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --abs_time_emb_dim 16 \
     --userpair_fids "62,63,64,65,66,89,90,91" \
     --userpair_log_fids "62,63,64,65,66" \
+    --userpair_hidden_mult 1 \
+    --userpair_dropout 0.3 \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \

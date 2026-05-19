@@ -202,6 +202,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--userpair_log_fids', type=str, default='',
                         help='Comma-separated paired user fids whose dense values '
                              'are transformed by log1p before pair fusion')
+    parser.add_argument('--userpair_dropout', type=float, default=0.2,
+                        help='Dropout used inside the optional userpair branch')
+    parser.add_argument('--userpair_hidden_mult', type=int, default=1,
+                        help='FFN multiplier for the optional userpair summary branch')
+    parser.add_argument('--userpair_mask_dense', action='store_true', default=False,
+                        help='Mask paired dense slices out of the base user_dense token. '
+                             'Default keeps baseline dense behavior and adds pair as a residual.')
 
     args = parser.parse_args()
     if args.userpair_fids:
@@ -333,6 +340,9 @@ def main() -> None:
         "item_ns_tokens": args.item_ns_tokens,
         "userpair_fids": args.userpair_fids,
         "userpair_log_fids": args.userpair_log_fids,
+        "userpair_hidden_mult": args.userpair_hidden_mult,
+        "userpair_dropout": args.userpair_dropout,
+        "userpair_mask_dense": args.userpair_mask_dense,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

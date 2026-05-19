@@ -1210,6 +1210,7 @@ class UserPairTokenizer(nn.Module):
         emb_dim: int,
         d_model: int,
         hidden_mult: int = 4,
+        dropout_rate: float = 0.0,
         emb_skip_threshold: int = 0,
     ) -> None:
         super().__init__()
@@ -1222,6 +1223,7 @@ class UserPairTokenizer(nn.Module):
         self.log_fids = set(int(fid) for fid in (log_fids or []))
         self.emb_dim = emb_dim
         self.d_model = d_model
+        self.dropout = nn.Dropout(dropout_rate)
 
         int_info: Dict[int, Tuple[int, int, int]] = {
             fid: (int(vs), int(offset), int(length))
@@ -1282,12 +1284,14 @@ class UserPairTokenizer(nn.Module):
             nn.Sequential(
                 nn.Linear(emb_dim, d_model),
                 nn.LayerNorm(d_model),
+                nn.Dropout(dropout_rate),
             )
             for _ in self.pair_fids
         ])
         self.summary_proj = nn.Sequential(
             nn.Linear(max(1, len(self.pair_fids)) * d_model, d_model * hidden_mult),
             nn.SiLU(),
+            nn.Dropout(dropout_rate),
             nn.Linear(d_model * hidden_mult, d_model),
             nn.LayerNorm(d_model),
         )
@@ -1317,9 +1321,9 @@ class UserPairTokenizer(nn.Module):
             mask = (int_vals > 0).float().unsqueeze(-1)
             denom = mask.sum(dim=1).clamp(min=1.0)
             pooled = (pair_pos * mask).sum(dim=1) / denom
-            tokens.append(F.silu(self.feature_projs[i](pooled)))
+            tokens.append(F.silu(self.feature_projs[i](self.dropout(pooled))))
 
-        return self.summary_proj(torch.cat(tokens, dim=-1))
+        return self.summary_proj(self.dropout(torch.cat(tokens, dim=-1)))
 
 
 class PCVRHyFormer(nn.Module):
@@ -1368,6 +1372,9 @@ class PCVRHyFormer(nn.Module):
         user_dense_feature_entries: Optional[List[Tuple[int, int, int]]] = None,
         userpair_fids: Optional[List[int]] = None,
         userpair_log_fids: Optional[List[int]] = None,
+        userpair_hidden_mult: int = 1,
+        userpair_dropout: float = 0.2,
+        userpair_mask_dense: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1400,6 +1407,8 @@ class PCVRHyFormer(nn.Module):
             ]
         else:
             self.userpair_log_fids = [int(fid) for fid in (userpair_log_fids or [])]
+        self.userpair_dropout = userpair_dropout
+        self.userpair_mask_dense = userpair_mask_dense
 
         # ================== NS Tokens Construction ==================
 
@@ -1473,7 +1482,8 @@ class PCVRHyFormer(nn.Module):
                 log_fids=self.userpair_log_fids,
                 emb_dim=emb_dim,
                 d_model=d_model,
-                hidden_mult=hidden_mult,
+                hidden_mult=userpair_hidden_mult,
+                dropout_rate=userpair_dropout,
                 emb_skip_threshold=emb_skip_threshold,
             )
             dense_offset_map = {
@@ -1487,18 +1497,23 @@ class PCVRHyFormer(nn.Module):
                         f"pair fid {fid} not found in user_dense_feature_entries"
                     )
                 offset, length = dense_offset_map[fid]
-                dense_pair_mask[offset:offset + length] = 0.0
-            self.user_pair_fusion = nn.Sequential(
-                nn.Linear(d_model * 2, d_model),
+                if userpair_mask_dense:
+                    dense_pair_mask[offset:offset + length] = 0.0
+            self.user_pair_adapter = nn.Sequential(
                 nn.LayerNorm(d_model),
+                nn.Dropout(userpair_dropout),
+                nn.Linear(d_model, d_model),
             )
+            nn.init.zeros_(self.user_pair_adapter[-1].weight)
+            nn.init.zeros_(self.user_pair_adapter[-1].bias)
             logging.info(
                 f"User pair branch enabled for fids={self.userpair_fids}, "
-                f"log_fids={self.userpair_log_fids}"
+                f"log_fids={self.userpair_log_fids}, "
+                f"dropout={userpair_dropout}, mask_dense={userpair_mask_dense}"
             )
         else:
             self.user_pair_tokenizer = None
-            self.user_pair_fusion = None
+            self.user_pair_adapter = None
         self.register_buffer('user_dense_pair_mask', dense_pair_mask, persistent=False)
 
         # User dense feature projection (if available)
@@ -1893,15 +1908,17 @@ class PCVRHyFormer(nn.Module):
                 dtype=inputs.user_dense_feats.dtype
             )
             user_dense_base = self.user_dense_proj(dense_input)
-            if self.has_user_pair and self.user_pair_tokenizer is not None:
+            if (
+                self.has_user_pair
+                and self.user_pair_tokenizer is not None
+                and self.user_pair_adapter is not None
+            ):
                 user_pair_tok = self.user_pair_tokenizer(
                     inputs.user_int_feats,
                     inputs.user_dense_feats,
                 )
                 user_dense_tok = F.silu(
-                    self.user_pair_fusion(
-                        torch.cat([user_dense_base, user_pair_tok], dim=-1)
-                    )
+                    user_dense_base + self.user_pair_adapter(user_pair_tok)
                 ).unsqueeze(1)
             else:
                 user_dense_tok = F.silu(user_dense_base).unsqueeze(1)  # (B, 1, D)
@@ -1955,15 +1972,17 @@ class PCVRHyFormer(nn.Module):
                 dtype=inputs.user_dense_feats.dtype
             )
             user_dense_base = self.user_dense_proj(dense_input)
-            if self.has_user_pair and self.user_pair_tokenizer is not None:
+            if (
+                self.has_user_pair
+                and self.user_pair_tokenizer is not None
+                and self.user_pair_adapter is not None
+            ):
                 user_pair_tok = self.user_pair_tokenizer(
                     inputs.user_int_feats,
                     inputs.user_dense_feats,
                 )
                 user_dense_tok = F.silu(
-                    self.user_pair_fusion(
-                        torch.cat([user_dense_base, user_pair_tok], dim=-1)
-                    )
+                    user_dense_base + self.user_pair_adapter(user_pair_tok)
                 ).unsqueeze(1)
             else:
                 user_dense_tok = F.silu(user_dense_base).unsqueeze(1)
